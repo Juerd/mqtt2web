@@ -214,8 +214,8 @@ while (1) {
 
         my $topics = join '|', map $_->{regex}, @{ $client->{topics} };
 
-        # If we're still subscribed (refcount == 0), the broker will handle
-        # sending retained messages for us, on subscription.
+        # If we're not currently subscribed (no refcount), the broker will
+        # handle sending retained messages for us, on resubscription.
         shout(
             [ $client ],
             $_,

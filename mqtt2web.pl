@@ -30,6 +30,7 @@ my @fake_retain = ('typing-speed-test.aoeu.eu');
 our @clients;
 my %topic_refcount;
 my %retain;
+my $delta = 0;
 
 *filter_as_regex = \&Net::MQTT::Simple::filter_as_regex;
 
@@ -48,10 +49,9 @@ sub HTTP::Daemon::ClientConn::chunk {
     my ($self, $chunk) = @_;
     no warnings qw(closed);
     if (not $use_chunked) {
-        print $self $chunk;
-        return;
+        return print $self $chunk;
     }
-    printf $self "%x%s%s%s",
+    return printf $self "%x%s%s%s",
         length $chunk,
         $CRLF,
         $chunk,
@@ -60,8 +60,8 @@ sub HTTP::Daemon::ClientConn::chunk {
 
 my $mqtt = Net::MQTT::Simple->new($mqtt_server);
 
-sub incoming {
-    my ($incoming_topic, $value, $retain) = @_;
+sub shout {
+    my ($clients, $incoming_topic, $value, $retain) = @_;
     eval { utf8::decode($value) };
 
     $retain ||= 2 if $incoming_topic =~ /$fake_retain_re/;
@@ -69,13 +69,12 @@ sub incoming {
 
     my $interested = 0;
 
-    for my $client (@clients) {
+    for my $client (@$clients) {
         next if not $client->{streaming};
 
         for my $client_topic (@{ $client->{topics} }) {
             next if $incoming_topic !~ $client_topic->{regex};
 
-            $interested++;
             my $event = $client_topic->{event}
                 ? "event: $client_topic->{event}$CRLF"
                 : "";
@@ -83,11 +82,20 @@ sub incoming {
             my $data = join $CRLF, map "data: $_", split /\r?\n/,
                 encode_json([ $incoming_topic, $value, $retain ]);
 
-            $client->{socket}->chunk("$event$data$CRLF$CRLF");
+            $client->{socket}->chunk("$event$data$CRLF$CRLF")
+                and $interested++;
         }
     }
+    return $interested;
+}
 
-    warn "Pushed $incoming_topic to $interested clients.\n";
+sub incoming {
+    my ($topic, $value, $retain) = @_;
+    my $num = shout \@clients, $topic, $value, $retain;
+    substr $value, 12, 3, "..." if length($value) > 15;
+    warn "\n" if $delta;
+    $delta = 0;
+    warn "Pushed $topic to $num clients: $value\n";
 }
 
 $mqtt->subscribe(map { $_ => \&incoming } @keep_subscribed);
@@ -110,6 +118,9 @@ $SIG{PIPE} = sub {
         my @gone = grep $topic_refcount{$_} == 0, keys %topic_refcount;
         $mqtt->unsubscribe(@gone);
         delete @topic_refcount{@gone};
+
+        print STDERR "-";
+        $delta++;
     }
 };
 
@@ -126,6 +137,8 @@ while (1) {
 
     while (my $socket = $d->accept) {
         push @clients, { socket => $socket, time => time(), streaming => 0 };
+        print STDERR "+";
+        $delta++;
     }
     CLIENT: for my $client (grep { not $_->{streaming} } @clients) {
         $_->{delete} and next;  # could be set by SIGPIPE
@@ -189,22 +202,20 @@ while (1) {
 
         $client->{streaming} = 1;
 
-        {
-            local @clients = $client;
-            my $topics = join '|', map $_->{regex}, @{ $client->{topics} };
+        my $topics = join '|', map $_->{regex}, @{ $client->{topics} };
 
-            # If we're still subscribed (refcount == 0), the broker will handle
-            # sending retained messages for us, on subscription.
-            incoming(
-                $_,
-                $retain{$_},
-                /$fake_retain_re/ ? (exists($topic_refcount{$_}) ? 2 : 3) : 1
-                # 1 = real, 2 = fake, 3 = fake + stale
-            ) for grep {
-                /$topics/
-                && (/$fake_retain_re/ || exists($topic_refcount{$_}))
-            } keys %retain;
-        }
+        # If we're still subscribed (refcount == 0), the broker will handle
+        # sending retained messages for us, on subscription.
+        shout(
+            [ $client ],
+            $_,
+            $retain{$_},
+            /$fake_retain_re/ ? (exists($topic_refcount{$_}) ? 2 : 3) : 1
+            # 1 = real, 2 = fake, 3 = fake + stale
+        ) for grep {
+            /$topics/
+            && (/$fake_retain_re/ || exists($topic_refcount{$_}))
+        } keys %retain;
 
         for my $key (map $_->{topic}, @{ $client->{topics} }) {
             $mqtt->subscribe($key => \&incoming)

@@ -18,7 +18,7 @@ my $port = 8080;
 my $mqtt_server = "test.mosquitto.org";
 my $maxtime = 10 * 60;
 my $request_timeout = 5;
-my $select_timeout = .025;
+my $select_timeout = .05;
 my $retry_min = 2;
 my $retry_extra = 8;
 my $use_chunked = 0;
@@ -136,7 +136,6 @@ while (1) {
     $mqtt->tick($select_timeout);
 
     while (my $socket = $d->accept) {
-        $socket->timeout($select_timeout);
         push @clients, { socket => $socket, time => time(), streaming => 0 };
         print STDERR "+";
         $delta++;
@@ -189,7 +188,6 @@ while (1) {
                 event => scalar $uri->query_param($key),
             };
         }
-
 
         exists $client->{topics}
             or $error->(400, "Great http, bad mqtt. Need topics!");

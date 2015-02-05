@@ -1,3 +1,15 @@
+MQTT to Server Sent Events (SSE) aka EventSource aka text/event-stream gateway
+
+mqtt2web lets HTTP clients subscribe to whitelisted MQTT topics. On the MQTT
+side, it subscribes and unsubscribes automatically.
+
+Please note: this implementation does not use or support WebSockets. Several
+MQTT brokers support WebSockets natively. SSE makes pushing events to a browser
+much easier.
+
+This gateway operates at QoS 0.
+
+Tested with mosquitto.
 
 
 Javascript example:
@@ -27,6 +39,12 @@ of the original retain flag. The retain value passed in the third value of the
 JSON array will be:
 
     0 = no retain
-    1 = real retain
-    2 = fake retain
-    3 = fake retain, stale data
+    1 = real retain, possibly stale
+    2 = fake retain, possibly stale
+    3 = fake retain, *probably* stale
+
+"Possibly stale" means it will be stale data if the connection to the MQTT
+broker is lost, "probably stale" means it's old because we unsubscribed from
+the topic automatically. To prevent MQTT unsubscription, add the topic to the
+array @keep_subscribed or always keep at least one HTTP client connected that
+subscribes to that topic.

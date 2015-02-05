@@ -2,24 +2,43 @@
 use strict;
 use warnings;
 use HTTP::Daemon;
-use Net::MQTT::Simple ();
+use Net::MQTT::Simple 1.17;
 use JSON::XS qw(encode_json);
+use URI::QueryParam;
+
+# Note: this will probably not work well with MQTT brokers that send duplicate
+# messages when subscriptions overlap, e.g. mosquitto with the setting
+# allow_duplicate_messages = false (defaults to true).
 
 my $CRLF = "\cM\cJ";
 
 # config
 $HTTP::Daemon::DEBUG = 0;
-my $port = 80;
+my $port = 8080;
+my $mqtt_server = "test.mosquitto.org";
 my $maxtime = 10 * 60;
 my $request_timeout = 5;
 my $select_timeout = .05;
 my $retry_min = 2;
 my $retry_extra = 8;
 my $use_chunked = 0;
+my @allowed_topics = ('#');
+my @keep_subscribed = ('typing-speed-test.aoeu.eu');
+my @fake_retain = ('typing-speed-test.aoeu.eu');
 
 # state
-my @clients;
-my $retain = "";
+our @clients;
+my %topic_refcount;
+my %retain;
+
+*filter_as_regex = \&Net::MQTT::Simple::filter_as_regex;
+
+my %keep_subscribed = map { $_ => 1 } @keep_subscribed;
+$topic_refcount{$_} = -1 for @keep_subscribed;
+
+my $keep_subscribed_re = join '|', map filter_as_regex($_), @keep_subscribed;
+my $allowed_topics_re  = join '|', map filter_as_regex($_), @allowed_topics;
+my $fake_retain_re     = join '|', map filter_as_regex($_), @fake_retain;
 
 sub HTTP::Daemon::ClientConn::chunk {
     my ($self, $chunk) = @_;
@@ -35,35 +54,40 @@ sub HTTP::Daemon::ClientConn::chunk {
         $CRLF;
 }
 
-sub shout {
-    @_ = map { split /\n/ } @_;
+my $mqtt = Net::MQTT::Simple->new($mqtt_server);
 
-    my @streaming = grep $_->{streaming}, @clients;
-    printf "Sending to %d clients: %s",
-        scalar @streaming, join "", map "$_\n", @_;
+sub incoming {
+            use Data::Dumper; warn Dumper \%topic_refcount;
+    my ($incoming_topic, $value, $retain) = @_;
+    eval { utf8::decode($value) };
 
-    my $now = time;
-    for my $client (@streaming) {
-        my $meuk = ($now - $client->{time});
-        $client->{socket}->chunk(
-            ":$meuk$CRLF" . join("", map {
-                "data: $_$CRLF"
-            } @_) . $CRLF
-        );
+    $retain = 2 if $incoming_topic =~ /$fake_retain_re/;
+    $retain{$incoming_topic} = $value if $retain;
+
+    my $interested = 0;
+
+    for my $client (@clients) {
+        next if not $client->{streaming};
+
+        for my $client_topic (@{ $client->{topics} }) {
+            next if $incoming_topic !~ $client_topic->{regex};
+
+            $interested++;
+            my $event = $client_topic->{event}
+                ? "event: $client_topic->{event}$CRLF"
+                : "";
+
+            my $data = join $CRLF, map "data: $_", split /\r?\n/,
+                encode_json([ $incoming_topic, $value, $retain ]);
+
+            $client->{socket}->chunk("$event$data$CRLF$CRLF");
+        }
     }
+
+    warn "Pushed $incoming_topic to $interested clients.\n";
 }
 
-my $mqtt = Net::MQTT::Simple->new("localhost");
-$mqtt->subscribe(
-    "#" => sub {
-        my ($topic, $value) = @_;
-        my ($cpm) = $value =~ /(\d+) CPM/ or return;
-        my $wpm = sprintf "%d", $cpm / 5;
-        shout $retain = encode_json {
-            cpm => $cpm+0, wpm => $wpm+0, time => time()
-        };
-    },
-);
+$mqtt->subscribe(map { $_ => \&incoming } @keep_subscribed);
 
 $SIG{PIPE} = sub {
     my $now = time;
@@ -76,6 +100,13 @@ $SIG{PIPE} = sub {
         $_->{socket}->chunk("") if $_->{streaming};
         $_->{delete} = 1;  # Delay because of foreach in main loop
         close $_->{socket};
+
+        $topic_refcount{$_}-- for grep !/$keep_subscribed_re/,
+            map $_->{topic}, @{ $_->{topics} };
+
+        my @gone = grep $topic_refcount{$_} == 0, keys %topic_refcount;
+        $mqtt->unsubscribe(@gone);
+        delete @topic_refcount{@gone};
     }
 };
 
@@ -93,19 +124,43 @@ while (1) {
     while (my $socket = $d->accept) {
         push @clients, { socket => $socket, time => time(), streaming => 0 };
     }
-    for my $client (grep { not $_->{streaming} } @clients) {
+    CLIENT: for my $client (grep { not $_->{streaming} } @clients) {
         $_->{delete} and next;  # could be set by SIGPIPE
 
         my $socket = $client->{socket};
         my $req = $socket->get_request($select_timeout) or next;
+        my $uri = $req->uri;
 
         if ($req->method !~ /^(?:GET|HEAD)$/) {
             $socket->send_error(405, "Hey, don't do that.");
             close $socket;
             next;
         }
-        if ($req->uri->path !~ /test/) {
+        if ($uri->path !~ m[^/*mqtt/*$]) {
             $socket->send_error(418, "Because 404 is boring.");
+            close $socket;
+            next;
+        }
+
+        for my $key ($uri->query_param) {
+            if ($key !~ /$allowed_topics_re/) {
+                $socket->send_error(403, "Topic $key is not in my whitelist.");
+                close $socket;
+                next CLIENT;
+            }
+            $mqtt->subscribe($key => \&incoming)
+                unless $keep_subscribed{$key}
+                or     $topic_refcount{$key}++;
+
+            push @{ $client->{topics} }, {
+                topic => $key,
+                regex => filter_as_regex($key),
+                event => scalar $uri->query_param($key),
+            };
+        }
+
+        if (not exists $client->{topics}) {
+            $socket->send_error(400, "Great http, bad mqtt. Need topics!");
             close $socket;
             next;
         }
@@ -131,8 +186,17 @@ while (1) {
         my $retry = int(($retry_min + rand $retry_extra) * 1000);
         $socket->chunk("retry: $retry$CRLF");
 
-        $socket->chunk("data: $retain$CRLF$CRLF");
         $client->{streaming} = 1;
+
+        {
+            local @clients = $client;
+            my $topics = join '|', map $_->{regex}, @{ $client->{topics} };
+
+            # If we're still subscribed (refcount == 0), the broker will handle
+            # sending retained messages for us, on subscription.
+            incoming($_, $retain{$_}, /$fake_retain_re/ ? 2 : 1)
+                for grep exists($topic_refcount{$_}) && /$topics/, keys %retain;
+        }
     }
 
     @clients = grep !$_->{delete}, @clients;

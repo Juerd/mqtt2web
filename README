@@ -11,6 +11,15 @@ Javascript example:
 
         ...
     });
+    s.addEventListener("b", ...);
+
+    var t = new EventSource("http://.../mqtt?revspace/%23=");
+    t.addEventListener("message", ...);
+
+If no event name is given after the "=" in a URL, the default event name
+("message") will be implied, but the "=" itself needs to be included.
+
+Note that # needs to be escaped in a URL: "revspace/#" becomes "revspace/%23".
 
 In normal MQTT, the retain flag is boolean. This gateway adds support for "fake
 retain", in which case the gateway will retain values regardless of the value

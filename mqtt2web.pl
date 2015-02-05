@@ -18,7 +18,7 @@ my $port = 8080;
 my $mqtt_server = "test.mosquitto.org";
 my $maxtime = 10 * 60;
 my $request_timeout = 5;
-my $select_timeout = .05;
+my $select_timeout = .025;
 my $retry_min = 2;
 my $retry_extra = 8;
 my $use_chunked = 0;
@@ -60,8 +60,8 @@ sub HTTP::Daemon::ClientConn::chunk {
 
 my $mqtt = Net::MQTT::Simple->new($mqtt_server);
 
-sub incoming {
-    my ($incoming_topic, $value, $retain) = @_;
+sub shout {
+    my ($clients, $incoming_topic, $value, $retain) = @_;
     eval { utf8::decode($value) };
 
     $retain ||= 2 if $incoming_topic =~ /$fake_retain_re/;
@@ -69,7 +69,7 @@ sub incoming {
 
     my $interested = 0;
 
-    for my $client (@clients) {
+    for my $client (@$clients) {
         next if not $client->{streaming};
 
         for my $client_topic (@{ $client->{topics} }) {
@@ -87,7 +87,12 @@ sub incoming {
         }
     }
 
-    warn "Pushed $incoming_topic to $interested clients.\n";
+    return $interested;
+}
+
+sub incoming {
+    my $num = shout \@clients, @_;
+    warn "Pushed $_[0] to $num clients.\n";
 }
 
 $mqtt->subscribe(map { $_ => \&incoming } @keep_subscribed);
@@ -131,6 +136,12 @@ while (1) {
         $_->{delete} and next;  # could be set by SIGPIPE
 
         my $socket = $client->{socket};
+
+        # Sometimes fileno returns false, resulting in HTTP::Daemon::_need_more
+        # select()ing on fd = 0 (stdin), which always timeouts. I don't know
+        # what's going on here.
+        $socket->fileno or next;
+
         my $req = $socket->get_request($select_timeout) or next;
         my $uri = $req->uri;
 
@@ -194,22 +205,20 @@ while (1) {
 
         $client->{streaming} = 1;
 
-        {
-            local @clients = $client;
-            my $topics = join '|', map $_->{regex}, @{ $client->{topics} };
+        my $topics = join '|', map $_->{regex}, @{ $client->{topics} };
 
-            # If we're still subscribed (refcount == 0), the broker will handle
-            # sending retained messages for us, on subscription.
-            incoming(
-                $_,
-                $retain{$_},
-                /$fake_retain_re/ ? (exists($topic_refcount{$_}) ? 2 : 3) : 1
-                # 1 = real, 2 = fake, 3 = fake + stale
-            ) for grep {
-                /$topics/
-                && (/$fake_retain_re/ || exists($topic_refcount{$_}))
-            } keys %retain;
-        }
+        # If we're still subscribed (refcount == 0), the broker will handle
+        # sending retained messages for us, on subscription.
+        shout(
+            [ $client ],
+            $_,
+            $retain{$_},
+            /$fake_retain_re/ ? (exists($topic_refcount{$_}) ? 2 : 3) : 1
+            # 1 = real, 2 = fake, 3 = fake + stale
+        ) for grep {
+            /$topics/
+            && (/$fake_retain_re/ || exists($topic_refcount{$_}))
+        } keys %retain;
 
         for my $key (map $_->{topic}, @{ $client->{topics} }) {
             $mqtt->subscribe($key => \&incoming)

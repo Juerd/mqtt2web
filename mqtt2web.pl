@@ -136,34 +136,52 @@ while (1) {
     $mqtt->tick($select_timeout);
 
     while (my $socket = $d->accept) {
+        $socket->timeout($select_timeout);
         push @clients, { socket => $socket, time => time(), streaming => 0 };
         print STDERR "+";
         $delta++;
     }
-    CLIENT: for my $client (grep { not $_->{streaming} } @clients) {
-        $_->{delete} and next;  # could be set by SIGPIPE
 
-        my $socket = $client->{socket};
-        my $req = $socket->get_request($select_timeout) or next;
+    my %socket2client;
+    my @can_read = IO::Select->new(
+        map { $socket2client{$_->{socket}} = $_; $_->{socket} }
+        grep { not $_->{delete} and not $_->{streaming} }
+        @clients
+    )->can_read($select_timeout);
+
+    CLIENT: for my $socket (@can_read) {
+        my $client = $socket2client{$socket};
+
+        $client->{delete} and next;
+
+        my $end = sub {
+            close $socket;
+            $client->{delete} = 1;
+            no warnings qw(exiting);
+            next CLIENT;
+        };
+        my $error = sub {
+            $socket->send_error(@_);
+            $end->();
+        };
+
+        my $req = $socket->get_request(1) or next;
         my $uri = $req->uri;
 
-        if ($req->method !~ /^(?:GET|HEAD)$/) {
-            $socket->send_error(405, "Hey, don't do that.");
-            close $socket;
-            next;
-        }
-        if ($uri->path !~ m[^/*mqtt/*$]) {
-            $socket->send_error(418, "Because 404 is boring.");
-            close $socket;
-            next;
-        }
+        $req->method =~ /^(?:GET|HEAD)$/
+            or $error->(405, "Oi, don't do that.");
+
+        $uri->path =~ m[^/*mqtt$]
+            or $error->(418, "Because 404 is boring.");
 
         for my $key ($uri->query_param) {
-            if ($key !~ /$allowed_topics_re/) {
-                $socket->send_error(403, "Topic $key is not in my whitelist.");
-                close $socket;
-                next CLIENT;
-            }
+
+            # MSIE EventSource polyfill.
+            next if $key eq 'lastEventId';
+            next if $key eq 'r';
+
+            $key =~ /$allowed_topics_re/
+                or $error->(403, "Topic $key is not in my whitelist.");
 
             push @{ $client->{topics} }, {
                 topic => $key,
@@ -173,11 +191,8 @@ while (1) {
         }
 
 
-        if (not exists $client->{topics}) {
-            $socket->send_error(400, "Great http, bad mqtt. Need topics!");
-            close $socket;
-            next;
-        }
+        exists $client->{topics}
+            or $error->(400, "Great http, bad mqtt. Need topics!");
 
         $socket->send_basic_header(200);
         $socket->send_header("Content-Type" => "text/event-stream");
@@ -187,10 +202,7 @@ while (1) {
         $socket->send_header("Transfer-Encoding" => "chunked") if $use_chunked;
         $socket->send_crlf;
 
-        if ($socket->head_request) {
-            close $socket;
-            next;
-        }
+        $end->() if $socket->head_request;
 
         if ($req->header("User-Agent") =~ /MSIE/) {
             $socket->chunk(":padding" x 256, $CRLF);

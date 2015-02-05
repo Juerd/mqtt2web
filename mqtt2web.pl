@@ -146,6 +146,11 @@ while (1) {
         }
 
         for my $key ($uri->query_param) {
+
+            # MSIE EventSource polyfill.
+            next if $key eq 'lastEventId';
+            next if $key eq 'r';
+
             if ($key !~ /$allowed_topics_re/) {
                 $socket->send_error(403, "Topic $key is not in my whitelist.");
                 close $socket;

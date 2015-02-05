@@ -23,7 +23,7 @@ my $retry_min = 2;
 my $retry_extra = 8;
 my $use_chunked = 0;
 my @allowed_topics = ('#');
-my @keep_subscribed = ('typing-speed-test.aoeu.eu');
+my @keep_subscribed = (); # ('typing-speed-test.aoeu.eu');
 my @fake_retain = ('typing-speed-test.aoeu.eu');
 
 # state
@@ -36,9 +36,13 @@ my %retain;
 my %keep_subscribed = map { $_ => 1 } @keep_subscribed;
 $topic_refcount{$_} = -1 for @keep_subscribed;
 
-my $keep_subscribed_re = join '|', map filter_as_regex($_), @keep_subscribed;
-my $allowed_topics_re  = join '|', map filter_as_regex($_), @allowed_topics;
-my $fake_retain_re     = join '|', map filter_as_regex($_), @fake_retain;
+my $never_match = '(?!)';
+my $keep_subscribed_re = join('|', map filter_as_regex($_), @keep_subscribed)
+    || $never_match;
+my $allowed_topics_re  = join('|', map filter_as_regex($_), @allowed_topics)
+    || $never_match;
+my $fake_retain_re     = join('|', map filter_as_regex($_), @fake_retain)
+    || $never_match;
 
 sub HTTP::Daemon::ClientConn::chunk {
     my ($self, $chunk) = @_;
@@ -57,11 +61,10 @@ sub HTTP::Daemon::ClientConn::chunk {
 my $mqtt = Net::MQTT::Simple->new($mqtt_server);
 
 sub incoming {
-            use Data::Dumper; warn Dumper \%topic_refcount;
     my ($incoming_topic, $value, $retain) = @_;
     eval { utf8::decode($value) };
 
-    $retain = 2 if $incoming_topic =~ /$fake_retain_re/;
+    $retain ||= 2 if $incoming_topic =~ /$fake_retain_re/;
     $retain{$incoming_topic} = $value if $retain;
 
     my $interested = 0;
@@ -148,9 +151,6 @@ while (1) {
                 close $socket;
                 next CLIENT;
             }
-            $mqtt->subscribe($key => \&incoming)
-                unless $keep_subscribed{$key}
-                or     $topic_refcount{$key}++;
 
             push @{ $client->{topics} }, {
                 topic => $key,
@@ -158,6 +158,7 @@ while (1) {
                 event => scalar $uri->query_param($key),
             };
         }
+
 
         if (not exists $client->{topics}) {
             $socket->send_error(400, "Great http, bad mqtt. Need topics!");
@@ -194,8 +195,21 @@ while (1) {
 
             # If we're still subscribed (refcount == 0), the broker will handle
             # sending retained messages for us, on subscription.
-            incoming($_, $retain{$_}, /$fake_retain_re/ ? 2 : 1)
-                for grep exists($topic_refcount{$_}) && /$topics/, keys %retain;
+            incoming(
+                $_,
+                $retain{$_},
+                /$fake_retain_re/ ? (exists($topic_refcount{$_}) ? 2 : 3) : 1
+                # 1 = real, 2 = fake, 3 = fake + stale
+            ) for grep {
+                /$topics/
+                && (/$fake_retain_re/ || exists($topic_refcount{$_}))
+            } keys %retain;
+        }
+
+        for my $key (map $_->{topic}, @{ $client->{topics} }) {
+            $mqtt->subscribe($key => \&incoming)
+                unless $keep_subscribed{$key}
+                or     $topic_refcount{$key}++;
         }
     }
 

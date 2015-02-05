@@ -1,0 +1,23 @@
+
+
+Javascript example:
+
+    var s = new EventSource("http://.../mqtt?topic1=a,topic2=b);
+    s.addEventListener("a", function (e) {
+        var json = JSON.parse(e.data),
+            topic  = json[0],
+            value  = json[1],
+            retain = json[2];
+
+        ...
+    });
+
+In normal MQTT, the retain flag is boolean. This gateway adds support for "fake
+retain", in which case the gateway will retain values regardless of the value
+of the original retain flag. The retain value passed in the third value of the
+JSON array will be:
+
+    0 = no retain
+    1 = real retain
+    2 = fake retain
+    3 = fake retain, stale data

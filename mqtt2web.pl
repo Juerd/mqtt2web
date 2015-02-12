@@ -16,6 +16,7 @@ my $CRLF = "\cM\cJ";
 $HTTP::Daemon::DEBUG = 0;
 my $port = 8080;
 my $mqtt_server = "test.mosquitto.org";
+my $maxaccept = 20;
 my $maxtime = 10 * 60;
 my $request_timeout = 5;
 my $select_timeout = .05;
@@ -103,12 +104,17 @@ $mqtt->subscribe(map { $_ => \&incoming } @keep_subscribed);
 $SIG{PIPE} = sub {
     my $now = time;
     for (@clients) {
-        next if $_->{socket}->connected
-            and $_->{streaming}
-            and ($_->{time} + $maxtime) > $now;
+        next if $_->{delete};
+
+        next if $_->{streaming}
+            and ($_->{time} + $maxtime) > $now
+            and $_->{socket}->connected;
+
         next if (not $_->{streaming})
             and ($_->{time} + $request_timeout) > $now;
+
         $_->{socket}->chunk("") if $_->{streaming};
+
         $_->{delete} = 1;  # Delay because of foreach in main loop
         close $_->{socket};
 
@@ -119,7 +125,7 @@ $SIG{PIPE} = sub {
         $mqtt->unsubscribe(@gone);
         delete @topic_refcount{@gone};
 
-        print STDERR "-";
+        print STDERR $_->{streaming} ? "-" : "!";
         $delta++;
     }
 };
@@ -127,7 +133,7 @@ $SIG{PIPE} = sub {
 my $d = HTTP::Daemon->new(
     LocalPort => $port,
     Reuse => 1,
-    Listen => 50
+    Listen => 50,
 ) or die $!;
 
 $d->timeout($select_timeout);
@@ -135,7 +141,9 @@ $d->timeout($select_timeout);
 while (1) {
     $mqtt->tick($select_timeout);
 
-    while (my $socket = $d->accept) {
+    my $accepted = 0;
+
+    while (my $socket = $d->accept and $accepted++ < $maxaccept) {
         push @clients, { socket => $socket, time => time(), streaming => 0 };
         print STDERR "+";
         $delta++;
@@ -155,16 +163,20 @@ while (1) {
 
         my $end = sub {
             close $socket;
+            print STDERR shift;
+            $delta++;
             $client->{delete} = 1;
             no warnings qw(exiting);
             next CLIENT;
         };
         my $error = sub {
             $socket->send_error(@_);
-            $end->();
+            $end->('E');
         };
 
-        my $req = $socket->get_request(1) or next;
+        my $req = $socket->get_request(1)
+            or $end->('G');
+
         my $uri = $req->uri;
 
         $req->method =~ /^(?:GET|HEAD)$/
@@ -200,7 +212,7 @@ while (1) {
         $socket->send_header("Transfer-Encoding" => "chunked") if $use_chunked;
         $socket->send_crlf;
 
-        $end->() if $socket->head_request;
+        $end->('H') if $socket->head_request;
 
         if ($req->header("User-Agent") =~ /MSIE/) {
             $socket->chunk(":padding" x 256, $CRLF);

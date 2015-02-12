@@ -15,8 +15,8 @@ my $CRLF = "\cM\cJ";
 
 # config
 $HTTP::Daemon::DEBUG = 0;
-my $port = 80;
-my $mqtt_server = "localhost";
+my $port = 8080;
+my $mqtt_server = 'test.mosquitto.org';
 my $maxaccept = 20;
 my $maxtime = 10 * 60;
 my $request_timeout = 10;
@@ -24,12 +24,11 @@ my $select_timeout = .05;
 my $retry_min = 5;
 my $retry_extra = 15;
 my $use_chunked = 0;
-my @allow_subscribe = ('typing-speed-test.aoeu.eu');
+my @allow_subscribe = ('typing-speed-test.aoeu.eu', 'example/#');
 my %allow_publish   = (
-    'typing-speed-test.aoeu.eu' => qr/^\d+ CPM$/,
-    'tst-internal/details' => qr/^[\r\n\x20-\x7f]+$/,  # ascii only
+    'example/+' => qr/^[a-z]+$/  # allow only letters
 );
-my @keep_subscribed = ('typing-speed-test.aoeu.eu');
+my @keep_subscribed = ();
 my @fake_retain     = ('typing-speed-test.aoeu.eu');
 
 # state

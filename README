@@ -12,6 +12,8 @@ This gateway operates at QoS 0.
 Tested with mosquitto.
 
 
+=== Subscribing ===
+
 Javascript example:
 
     var s = new EventSource("http://.../mqtt?topic1=a,topic2=b);
@@ -48,3 +50,17 @@ broker is lost, "probably stale" means it's old because we unsubscribed from
 the topic automatically. To prevent MQTT unsubscription, add the topic to the
 array @keep_subscribed or always keep at least one HTTP client connected that
 subscribes to that topic.
+
+
+=== Publishing ===
+
+Just send a POST request over HTTP with typical text/x-www-form-urlencoded
+key/value pairs, where the keys are the values to publish to. Here's a jQuery
+example to illustrate the concept:
+
+    $.post("http://.../mqtt", {
+        "example/topic": "some value",
+        "example": "multiple publishes can be done with one POST request"
+    });
+
+For publishing messages, this gateway does not (yet) support the retain flag.

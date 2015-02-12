@@ -2,6 +2,7 @@
 use strict;
 use warnings;
 use HTTP::Daemon;
+use HTTP::Status qw(status_message);
 use Net::MQTT::Simple 1.17;
 use JSON::XS qw(encode_json);
 use URI::QueryParam;
@@ -14,18 +15,22 @@ my $CRLF = "\cM\cJ";
 
 # config
 $HTTP::Daemon::DEBUG = 0;
-my $port = 8080;
-my $mqtt_server = "test.mosquitto.org";
+my $port = 80;
+my $mqtt_server = "localhost";
 my $maxaccept = 20;
 my $maxtime = 10 * 60;
-my $request_timeout = 5;
+my $request_timeout = 10;
 my $select_timeout = .05;
-my $retry_min = 2;
-my $retry_extra = 8;
+my $retry_min = 5;
+my $retry_extra = 15;
 my $use_chunked = 0;
-my @allowed_topics = ('#');
-my @keep_subscribed = (); # ('typing-speed-test.aoeu.eu');
-my @fake_retain = ('typing-speed-test.aoeu.eu');
+my @allow_subscribe = ('typing-speed-test.aoeu.eu');
+my %allow_publish   = (
+    'typing-speed-test.aoeu.eu' => qr/^\d+ CPM$/,
+    'tst-internal/details' => qr/^[\r\n\x20-\x7f]+$/,  # ascii only
+);
+my @keep_subscribed = ('typing-speed-test.aoeu.eu');
+my @fake_retain     = ('typing-speed-test.aoeu.eu');
 
 # state
 our @clients;
@@ -41,7 +46,7 @@ $topic_refcount{$_} = -1 for @keep_subscribed;
 my $never_match = '(?!)';
 my $keep_subscribed_re = join('|', map filter_as_regex($_), @keep_subscribed)
     || $never_match;
-my $allowed_topics_re  = join('|', map filter_as_regex($_), @allowed_topics)
+my $allow_subscribe_re = join('|', map filter_as_regex($_), @allow_subscribe)
     || $never_match;
 my $fake_retain_re     = join('|', map filter_as_regex($_), @fake_retain)
     || $never_match;
@@ -170,46 +175,93 @@ while (1) {
             next CLIENT;
         };
         my $error = sub {
-            $socket->send_error(@_);
+            my ($code, $message) = @_;
+            # Built-in send_error only does text/html
+            my $body = "$code - " . status_message($code) ."$CRLF$message$CRLF";
+            $socket->send_basic_header($code);
+            $socket->send_header("Connection" => "close");
+            $socket->send_header("Content-Type" => "text/plain");
+            $socket->send_header("Content-Length" => length $body);
+            $socket->send_crlf();
+            print {$socket} $body;
             $end->('E');
         };
 
-        my $req = $socket->get_request(1)
+        my $req = $socket->get_request(0)
             or $end->('G');
 
         my $uri = $req->uri;
+        my $method = $req->method;
 
-        $req->method =~ /^(?:GET|HEAD)$/
+        $method =~ /^(?:GET|HEAD|POST)$/
             or $error->(405, "Oi, don't do that.");
 
         $uri->path =~ m[^/*mqtt$]
             or $error->(418, "Because 404 is boring.");
 
+        # Cheat: turn body into query string
+        $uri->query( $req->content ) if $method eq 'POST';
+
+        my $good_topics = 0;
+
         for my $key ($uri->query_param) {
+            my $value = $uri->query_param($key);
 
             # MSIE EventSource polyfill.
             next if $key eq 'lastEventId';
             next if $key eq 'r';
 
-            $key =~ /$allowed_topics_re/
-                or $error->(403, "Topic $key is not in my whitelist.");
+            $good_topics++;
 
-            push @{ $client->{topics} }, {
-                topic => $key,
-                regex => filter_as_regex($key),
-                event => scalar $uri->query_param($key),
-            };
+            if ($method eq 'POST') {
+                my $valid_key;
+                my $valid_value;
+                for my $filter (keys %allow_publish) {
+                    my $topic_regex = filter_as_regex($filter);
+                    my $value_regex = $allow_publish{$filter};
+                    if ($key =~ /$topic_regex/) {
+                        $valid_key = 1;
+                        $valid_value ||= ($value =~ /$value_regex/);
+                    }
+                }
+                $valid_key
+                    or $error->(403, "Topic $key is not in my POST whitelist.");
+                $valid_value
+                    or $error->(403, "I don't like the value for $key.");
+
+                $mqtt->publish($key, $value);
+            } else {
+                $key =~ /$allow_subscribe_re/
+                    or $error->(403, "Topic $key is not in my GET whitelist.");
+
+                push @{ $client->{topics} }, {
+                    topic => $key,
+                    regex => filter_as_regex($key),
+                    event => $value,
+                };
+            }
         }
 
-        exists $client->{topics}
-            or $error->(400, "Great http, bad mqtt. Need topics!");
+        $good_topics or $error->(400, "Great http, bad mqtt. Need topics!");
 
         $socket->send_basic_header(200);
-        $socket->send_header("Content-Type" => "text/event-stream");
         $socket->send_header("Access-Control-Allow-Origin" => "*");
-        $socket->send_header("Connection" => "close");
         $socket->send_header("Cache-Control" => "no-transform,no-cache");
+
+        if ($method eq 'POST') {
+            my $body = "Done.$CRLF";
+            $socket->send_header("Content-Type" => "text/event-stream");
+            $socket->send_header("Content-Length" => length $body);
+            $socket->send_crlf;
+            print {$socket} $body;
+            print STDERR "P";
+            $delta++;
+            next CLIENT;
+        }
+
         $socket->send_header("Transfer-Encoding" => "chunked") if $use_chunked;
+        $socket->send_header("Content-Type" => "text/event-stream");
+        $socket->send_header("Connection" => "close");
         $socket->send_crlf;
 
         $end->('H') if $socket->head_request;

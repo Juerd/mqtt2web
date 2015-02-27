@@ -6,6 +6,7 @@ use HTTP::Status qw(status_message);
 use Net::MQTT::Simple 1.17;
 use JSON::XS qw(encode_json);
 use URI::QueryParam;
+use Linux::Epoll;
 
 # Note: this will probably not work well with MQTT brokers that send duplicate
 # messages when subscriptions overlap, e.g. mosquitto with the setting
@@ -16,11 +17,12 @@ my $CRLF = "\cM\cJ";
 # config
 $HTTP::Daemon::DEBUG = 0;
 my $port = 80;
-my $mqtt_server = "localhost";
+my $mqtt_server = "::1";
 my $maxaccept = 20;
 my $maxtime = 10 * 60;
 my $request_timeout = 10;
-my $select_timeout = .05;
+my $select_timeout = .02;
+my $client_select_timeout = .05;
 my $retry_min = 5;
 my $retry_extra = 15;
 my $use_chunked = 0;
@@ -51,17 +53,50 @@ my $allow_subscribe_re = join('|', map filter_as_regex($_), @allow_subscribe)
 my $fake_retain_re     = join('|', map filter_as_regex($_), @fake_retain)
     || $never_match;
 
-sub HTTP::Daemon::ClientConn::chunk {
-    my ($self, $chunk) = @_;
-    no warnings qw(closed);
-    if (not $use_chunked) {
-        return print $self $chunk;
+{
+    package HTTP::Daemon::Blah;
+    use base 'HTTP::Daemon';
+
+    sub accept {
+        shift->SUPER::accept('HTTP::Daemon::ClientConn::Blah');
     }
-    return printf $self "%x%s%s%s",
-        length $chunk,
-        $CRLF,
-        $chunk,
-        $CRLF;
+
+    package HTTP::Daemon::ClientConn::Blah;
+    use base 'HTTP::Daemon::ClientConn';
+
+    sub chunk {
+        my ($self, $chunk) = @_;
+        no warnings qw(closed);
+        if (not $use_chunked) {
+            return print $self $chunk;
+        }
+        return printf $self "%x%s%s%s",
+            length $chunk,
+            $CRLF,
+            $chunk,
+            $CRLF;
+    }
+
+    my $epoll = Linux::Epoll->new;
+    sub _need_more {
+        # Hack: use epoll instead of select
+        my $self = shift;
+        my $timeout = $_[1];
+        if ($timeout) {
+            my $n = 0;
+            $epoll->add($self, 'in', sub {
+                shift->{in} or return;
+                $n = 1;
+            });
+            $epoll->wait(1, $timeout);
+            $epoll->delete($self);
+            if (not $n) {
+                main::poll();  # accept() asap.
+                return;
+            }
+        }
+        $self->SUPER::_need_more($_[0]);
+    }
 }
 
 my $mqtt = Net::MQTT::Simple->new($mqtt_server);
@@ -106,6 +141,9 @@ sub incoming {
 
 $mqtt->subscribe(map { $_ => \&incoming } @keep_subscribed);
 
+my $epoll = Linux::Epoll->new;
+my @can_read;
+
 $SIG{PIPE} = sub {
     my $now = time;
     for (@clients) {
@@ -135,7 +173,7 @@ $SIG{PIPE} = sub {
     }
 };
 
-my $d = HTTP::Daemon->new(
+my $d = HTTP::Daemon::Blah->new(
     LocalPort => $port,
     Reuse => 1,
     Listen => 50,
@@ -143,30 +181,39 @@ my $d = HTTP::Daemon->new(
 
 $d->timeout($select_timeout);
 
-while (1) {
-    $mqtt->tick($select_timeout);
+$epoll->add($d, 'in', sub {
+    shift->{in} or return;
 
-    my $accepted = 0;
-
-    while (my $socket = $d->accept and $accepted++ < $maxaccept) {
-        push @clients, { socket => $socket, time => time(), streaming => 0 };
+    while (my $socket = $d->accept) { #  and $accepted++ < $maxaccept) {
+        my $client = { socket => $socket, time => time(), streaming => 0 };
+        push @clients, $client;
+        $epoll->add($socket, 'in', sub {
+            shift->{in} or return;
+            push @can_read, $client;
+        });
+        $socket->timeout($client_select_timeout);
         print STDERR "+";
         $delta++;
     }
+});
 
-    my %socket2client;
-    my @can_read = IO::Select->new(
-        map { $socket2client{$_->{socket}} = $_; $_->{socket} }
-        grep { not $_->{delete} and not $_->{streaming} }
-        @clients
-    )->can_read($select_timeout);
+sub poll {
+    $epoll->wait(1e4, $select_timeout);
+}
 
-    CLIENT: for my $socket (@can_read) {
-        my $client = $socket2client{$socket};
+while (1) {
+    $mqtt->tick($select_timeout);
+
+    poll();
+
+    CLIENT: for my $client (@can_read) {
+        my $socket = $client->{socket};
 
         $client->{delete} and next;
+        $client->{streaming} and next;
 
         my $end = sub {
+            eval { $epoll->delete($socket) } if $socket->fileno();
             close $socket;
             print STDERR shift;
             $delta++;
@@ -189,6 +236,8 @@ while (1) {
 
         my $req = $socket->get_request(0)
             or $end->('G');
+
+        $epoll->delete($socket);
 
         my $uri = $req->uri;
         my $method = $req->method;
@@ -297,6 +346,8 @@ while (1) {
                 or     $topic_refcount{$key}++;
         }
     }
+
+    @can_read = ();
 
     @clients = grep !$_->{delete}, @clients;
 }

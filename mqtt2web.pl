@@ -8,6 +8,16 @@ use JSON::XS qw(encode_json);
 use URI::QueryParam;
 use Linux::Epoll;
 
+### BEGIN INIT INFO
+# Provides:          mqtt2web
+# Required-Start:    mosquitto $remote_fs $syslog
+# Required-Stop:     mosquitto $remote_fs $syslog
+# Default-Start:     2 3 4 5
+# Default-Stop:      0 1 6
+# Short-Description: MQTT -> HTTP(S) (Content-Type: text/event-stream)
+# Description:       A daemon that will listen on specified MQTT channels and when a message arrives, will send that to any active clients as an HTTP event-stream message
+### END INIT INFO
+
 # Note: this will probably not work well with MQTT brokers that send duplicate
 # messages when subscriptions overlap, e.g. mosquitto with the setting
 # allow_duplicate_messages = false (defaults to true).
